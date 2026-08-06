@@ -1,0 +1,64 @@
+# .gitignore for TDTC-AI-CCTV
+
+# 1. 가상환경 및 패키지
+.venv/
+venv/
+ENV/
+env/
+bin/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 2. 로컬 환경 설정 및 비밀 인증키 (절대 커밋 금지)
+.env
+.env.local
+.env.*.local
+*.private
+
+# 3. 대용량 테스트 비디오 파일 및 데이터 디렉터리
+test/
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# 4. AI 모델 가중치 및 대용량 파일 (가중치는 클라우드나 로컬에 별도 보관)
+models/*.pth
+models/*.pt
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# 5. 파이썬 컴파일 캐시 및 툴 설정
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# 6. 임시 분석 산출물 및 캐시
+results/
+*.csv
+*.json
+!ai_pipeline/cctv_upload/core/zones_config.json
+
+# 7. 결과물 기록물들
+daily_reports/
+
