@@ -8,11 +8,16 @@ load_dotenv()
 
 # DB 접속 정보 파싱
 # jdbc:postgresql://aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres?sslmode=require 형태를 파싱하거나 기본값 사용
-DB_HOST = "aws-0-ap-northeast-1.pooler.supabase.com"
-DB_PORT = 5432
-DB_NAME = "postgres"
-DB_USER = "postgres.uusnthiedfwzlcsgtnhn"
-DB_PASS = "tdtcStrong10!"
+DB_HOST = os.environ.get("DB_HOST", "aws-0-ap-northeast-1.pooler.supabase.com")
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ.get("DB_NAME", "postgres")
+DB_USER = os.environ.get("DB_USER", "postgres.uusnthiedfwzlcsgtnhn")
+
+# 2026-08-08: 공개 저장소라 비밀번호 하드코딩을 제거했다.
+# 반드시 루트 .env 또는 환경변수로 주입할 것.
+DB_PASS = os.environ.get("DB_PASSWORD", "")
+if not DB_PASS:
+    print("[WARNING] DB_PASSWORD 환경변수가 비어 있습니다. 루트 .env 파일을 확인하세요.")
 
 print("=" * 70)
 print(" [INFO] [Supabase DB - 긴급 신고 & S3 연동 적재 데이터 간편 조회] ")

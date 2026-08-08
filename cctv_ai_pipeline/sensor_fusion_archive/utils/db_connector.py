@@ -32,7 +32,11 @@ DB_HOST = os.environ.get("DB_HOST", "aws-0-ap-northeast-1.pooler.supabase.com")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 DB_NAME = os.environ.get("DB_NAME", "postgres")
 DB_USER = os.environ.get("DB_USER", "postgres.uusnthiedfwzlcsgtnhn")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "tdtcStrong10!")
+# 2026-08-08: 공개 저장소라 실제 비밀번호를 기본값으로 두면 그대로 노출된다.
+# 하드코딩을 제거했으니 반드시 루트 .env 또는 환경변수로 주입할 것.
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+if not DB_PASSWORD:
+    print("[WARNING] DB_PASSWORD 환경변수가 비어 있습니다. 루트 .env 파일을 확인하세요.")
 
 def get_db_connection():
     """Supabase PostgreSQL 접속 커넥션 반환"""

@@ -31,7 +31,11 @@ if not db_url:
 if not db_user:
     db_user = os.environ.get("DEV_DB_USERNAME", "postgres.uusnthiedfwzlcsgtnhn")
 if not db_password:
-    db_password = os.environ.get("DEV_DB_PASSWORD", "tdtcStrong10!")
+    # 2026-08-08: 공개 저장소라 비밀번호 하드코딩을 제거했다.
+    # 반드시 루트 .env 또는 환경변수로 주입할 것.
+    db_password = os.environ.get("DEV_DB_PASSWORD", "")
+    if not db_password:
+        print("[WARNING] DEV_DB_PASSWORD 환경변수가 비어 있습니다. 루트 .env 파일을 확인하세요.")
 
 # jdbc:postgresql:// -> postgresql:// 변환
 if db_url.startswith("jdbc:"):
