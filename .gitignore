@@ -27,6 +27,7 @@ wheels/
 .env.local
 .env.*.local
 *.private
+.env.example
 
 # 3. 대용량 테스트 비디오 파일 및 데이터 디렉터리
 test/
