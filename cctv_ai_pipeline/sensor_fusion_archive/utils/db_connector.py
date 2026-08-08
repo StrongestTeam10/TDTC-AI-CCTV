@@ -12,6 +12,7 @@ def load_env():
     candidates = [
         os.path.join(current_dir, "..", "..", ".env"),
         os.path.join(current_dir, "..", "..", "..", ".env"),
+        os.path.join(current_dir, "..", "..", "..", "..", ".env"),
         os.path.join(current_dir, "..", ".env")
     ]
     for env_path in candidates:
