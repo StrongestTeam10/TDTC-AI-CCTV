@@ -12,12 +12,73 @@ from fastapi.responses import FileResponse, StreamingResponse
 import numpy as np
 
 from server.config import (
-    BASE_DIR, TEMP_UPLOAD_DIR, UPLOAD_DIR, RESULTS_DIR, pipeline_state
+    BASE_DIR, TEMP_UPLOAD_DIR, UPLOAD_DIR, RESULTS_DIR, MODELS_DIR, pipeline_state
+)
+from server.models import (
+    torch_available, CSRNet, csr_transform, extract_peaks_from_density, apply_mosaic
 )
 from server.services import process_ai_pipeline
 from server.websocket import manager
 
 router = APIRouter(tags=["분석 (WebSocket)"])
+
+# 비전 AI 모델 전역 싱글톤 캐시
+_vision_models = {
+    "csrnet": None,
+    "yolo": None,
+    "hog": None,
+    "device": None,
+    "initialized": False
+}
+
+
+def get_shared_vision_models():
+    """실시간 스트리밍을 위한 비전 모델 싱글톤 초기화"""
+    if _vision_models["initialized"]:
+        return _vision_models
+
+    # 1. PyTorch CSRNet
+    if torch_available and CSRNet is not None:
+        try:
+            import torch
+            dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = CSRNet().to(dev)
+            m_path = os.path.join(MODELS_DIR, "csrnet_ultimate_epoch_8.pth")
+            if os.path.exists(m_path):
+                ckpt = torch.load(m_path, map_location=dev)
+                sd = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+                model.load_state_dict(sd, strict=False)
+                model.eval()
+                _vision_models["csrnet"] = model
+                _vision_models["device"] = dev
+                print(f"[Vision Setup] 실시간 CSRNet 로드 완료 ({dev})")
+        except Exception as e:
+            print(f"[Vision Setup] CSRNet 로드 생략: {e}")
+
+    # 2. YOLOv8
+    try:
+        from ultralytics import YOLO
+        yolo_path = os.path.join(MODELS_DIR, "yolo11n.pt")
+        if not os.path.exists(yolo_path):
+            yolo_path = os.path.join(MODELS_DIR, "bestYOLOm5080model.pt")
+        if not os.path.exists(yolo_path):
+            yolo_path = "yolo11n.pt"
+        yolo_model = YOLO(yolo_path)
+        _vision_models["yolo"] = yolo_model
+        print(f"[Vision Setup] 실시간 YOLOv8 로드 완료: {yolo_path}")
+    except Exception as e:
+        print(f"[Vision Setup] YOLOv8 로드 생략: {e}")
+
+    # 3. HOG
+    try:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _vision_models["hog"] = hog
+    except Exception:
+        pass
+
+    _vision_models["initialized"] = True
+    return _vision_models
 
 
 def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
@@ -52,20 +113,28 @@ def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
 
 
 async def generate_mjpeg_stream(zone_id: int):
-    """MJPEG 스트림 생성기 (무한 루프)"""
+    """실시간 AI 보행자 검출 + 가우시안 모자이크 비식별화 MJPEG 스트림 생성기"""
     video_path = find_sample_video_for_zone(zone_id)
     if not video_path:
         while True:
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            cv2.putText(frame, f"CCTV Zone {zone_id} LIVE STREAM", (350, 360), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
-            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (450, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, f"CCTV Zone {zone_id} Stream Waiting...", (350, 360), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
             _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             await asyncio.sleep(0.1)
 
+    v_models = get_shared_vision_models()
+    csrnet = v_models["csrnet"]
+    yolo = v_models["yolo"]
+    hog = v_models["hog"]
+    device = v_models["device"]
+
     cap = cv2.VideoCapture(video_path)
+    frame_idx = 0
+    cached_boxes = []
+
     try:
         while True:
             ret, frame = cap.read()
@@ -75,14 +144,64 @@ async def generate_mjpeg_stream(zone_id: int):
                 if not ret:
                     break
 
+            frame_idx += 1
             if frame.shape[0] != 720 or frame.shape[1] != 1280:
                 frame = cv2.resize(frame, (1280, 720))
+
+            # 2프레임마다 인물 검출(YOLO/CSRNet/HOG) 갱신하여 부드러운 FPS 유지
+            if frame_idx % 2 == 1 or not cached_boxes:
+                detected_boxes = []
+
+                # A. YOLOv8 실시간 탐지 (가장 정밀함)
+                if yolo is not None:
+                    try:
+                        res = yolo(frame, classes=[0], verbose=False, conf=0.25)
+                        if len(res) > 0 and len(res[0].boxes) > 0:
+                            for b in res[0].boxes:
+                                coords = b.xyxy[0].cpu().numpy()
+                                detected_boxes.append((coords[0], coords[1], coords[2], coords[3]))
+                    except Exception:
+                        pass
+
+                # B. CSRNet 피크 탐지 (군중 밀집 시)
+                if not detected_boxes and csrnet is not None and device is not None:
+                    try:
+                        import torch
+                        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        tensor = csr_transform(img_rgb).unsqueeze(0).to(device)
+                        with torch.no_grad():
+                            dm = csrnet(tensor)
+                            dm = torch.clamp(dm, min=0)
+                        peaks = extract_peaks_from_density(dm.squeeze().cpu().numpy())
+                        scale_x = 1280.0 / dm.shape[3]
+                        scale_y = 720.0 / dm.shape[2]
+                        for px, py in peaks:
+                            u, v = px * scale_x, py * scale_y
+                            detected_boxes.append((u - 30, v - 30, u + 30, v + 30))
+                    except Exception:
+                        pass
+
+                # C. OpenCV HOG 탐지 (폴백)
+                if not detected_boxes and hog is not None:
+                    try:
+                        boxes, _ = hog.detectMultiScale(frame, winStride=(8, 8), padding=(4, 4), scale=1.05)
+                        for (x, y, w, h) in boxes:
+                            detected_boxes.append((x, y, x + w, y + h))
+                    except Exception:
+                        pass
+
+                if detected_boxes:
+                    cached_boxes = detected_boxes
+
+            # 검출된 인물 영역에 가우시안 타원형 모자이크 비식별화 실시간 적용
+            for (x1, y1, x2, y2) in cached_boxes:
+                frame = apply_mosaic(frame, x1, y1, x2, y2)
 
             _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            await asyncio.sleep(0.1) # 10 FPS
+            await asyncio.sleep(0.06) # 약 16 FPS
     finally:
         cap.release()
 
