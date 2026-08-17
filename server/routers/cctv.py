@@ -8,15 +8,81 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, File, UploadFile, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+import numpy as np
 
 from server.config import (
-    TEMP_UPLOAD_DIR, UPLOAD_DIR, RESULTS_DIR, pipeline_state
+    BASE_DIR, TEMP_UPLOAD_DIR, UPLOAD_DIR, RESULTS_DIR, pipeline_state
 )
 from server.services import process_ai_pipeline
 from server.websocket import manager
 
 router = APIRouter(tags=["분석 (WebSocket)"])
+
+
+def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
+    """구역별 실시간 스트림용 샘플 비디오 경로 탐색"""
+    candidates = [
+        os.path.join(RESULTS_DIR, f"zone_{zone_id}_live.mp4"),
+        os.path.join(RESULTS_DIR, "cctv_simulation_video.mp4"),
+        os.path.join(RESULTS_DIR, "processed_cctv_20260811_223259_test_north04.mp4"),
+        os.path.join(RESULTS_DIR, "stabilization_720p_fp16_verification.mp4"),
+        os.path.join(BASE_DIR, "cctv_simulation_video.mp4"),
+        "e:/AIVLE_10team/TDTC-AI-FE/dist/cctv_mangwon_live.mp4",
+        "e:/AIVLE_10team/ai_pipeline/results/cctv_simulation_video.mp4",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+async def generate_mjpeg_stream(zone_id: int):
+    """MJPEG 스트림 생성기 (무한 루프)"""
+    video_path = find_sample_video_for_zone(zone_id)
+    if not video_path:
+        while True:
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            cv2.putText(frame, f"CCTV Zone {zone_id} LIVE STREAM", (350, 360), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
+            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (450, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            await asyncio.sleep(0.1)
+
+    cap = cv2.VideoCapture(video_path)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+            if frame.shape[0] != 720 or frame.shape[1] != 1280:
+                frame = cv2.resize(frame, (1280, 720))
+
+            cv2.putText(frame, f"ZONE {zone_id} LIVE", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 128), 2)
+            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            await asyncio.sleep(0.1) # 10 FPS
+    finally:
+        cap.release()
+
+
+@router.get("/api/v1/cctv/stream")
+async def stream_cctv_live(zone_id: int = 1):
+    """프론트엔드 갤러리 카드/모달용 실시간 MJPEG 비디오 스트리밍 엔드포인트"""
+    return StreamingResponse(
+        generate_mjpeg_stream(zone_id),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
 
 @router.post("/api/v1/cctv/upload")
