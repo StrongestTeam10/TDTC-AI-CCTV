@@ -21,7 +21,21 @@ router = APIRouter(tags=["분석 (WebSocket)"])
 
 
 def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
-    """구역별 실시간 스트림용 샘플 비디오 경로 탐색 (고품질 stabilization_verification 우선)"""
+    """구역별(zone_id 1, 2, 3) 실시간 스트림용 샘플 비디오 경로 탐색"""
+    # 1. zone/zone_id{zone_id} 폴더 내의 비디오 최우선 탐색
+    candidates_zone_dirs = [
+        os.path.join(BASE_DIR, "..", "zone", f"zone_id{zone_id}"),
+        os.path.join(BASE_DIR, "zone", f"zone_id{zone_id}"),
+        f"e:/AIVLE_10team/zone/zone_id{zone_id}",
+    ]
+    for z_dir in candidates_zone_dirs:
+        if os.path.exists(z_dir):
+            for fname in sorted(os.listdir(z_dir)):
+                if fname.lower().endswith(".mp4"):
+                    v_path = os.path.join(z_dir, fname)
+                    return v_path
+
+    # 2. results 폴더 내 구역 파일 탐색
     candidates = [
         os.path.join(RESULTS_DIR, f"zone_{zone_id}_live.mp4"),
         os.path.join(RESULTS_DIR, "stabilization_720p_fp16_verification.mp4"),
@@ -30,8 +44,6 @@ def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
         os.path.join(RESULTS_DIR, "cctv_simulation_video.mp4"),
         os.path.join(BASE_DIR, "cctv_simulation_video.mp4"),
         "e:/AIVLE_10team/TDTC-AI-FE/dist/cctv_mangwon_live.mp4",
-        "e:/AIVLE_10team/ai_pipeline/results/stabilization_720p_fp16_verification.mp4",
-        "e:/AIVLE_10team/ai_pipeline/results/stabilization_verification.mp4",
     ]
     for c in candidates:
         if os.path.exists(c):
