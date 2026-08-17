@@ -114,15 +114,25 @@ def extract_peaks_from_density(density_map: np.ndarray, threshold: float = 0.005
 
 
 def apply_mosaic(img: np.ndarray, x1: float, y1: float, x2: float, y2: float, neighbor: int = 15):
-    """지정된 바운딩 박스 영역에 자연스러운 가우시안 블러 비식별화(모자이크) 적용"""
+    """지정된 바운딩 박스/머리 영역에 부드러운 타원형 가우시안 블러 비식별화(모자이크) 적용"""
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(img.shape[1], int(x2)), min(img.shape[0], int(y2))
     w, h = x2 - x1, y2 - y1
     if w <= 0 or h <= 0:
         return img
+
     roi = img[y1:y2, x1:x2]
-    kernel_w = max(3, (w // 2) * 2 + 1)
-    kernel_h = max(3, (h // 2) * 2 + 1)
-    blurred = cv2.GaussianBlur(roi, (kernel_w, kernel_h), sigmaX=15, sigmaY=15)
-    img[y1:y2, x1:x2] = blurred
+    kernel_w = max(5, (w // 2) * 2 + 1)
+    kernel_h = max(5, (h // 2) * 2 + 1)
+    blurred = cv2.GaussianBlur(roi, (kernel_w, kernel_h), sigmaX=20, sigmaY=20)
+
+    # 타원형 페더링 마스크를 생성하여 경계면을 자연스럽게 알파 블렌딩
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.ellipse(mask, (w // 2, h // 2), (w // 2, h // 2), 0, 0, 360, 1.0, -1)
+    if min(w, h) >= 15:
+        mask = cv2.GaussianBlur(mask, (15, 15), 5)
+    mask = np.expand_dims(mask, axis=2)
+
+    blended = (blurred.astype(np.float32) * mask + roi.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
+    img[y1:y2, x1:x2] = blended
     return img

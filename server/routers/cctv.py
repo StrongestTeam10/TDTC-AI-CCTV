@@ -21,15 +21,17 @@ router = APIRouter(tags=["분석 (WebSocket)"])
 
 
 def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
-    """구역별 실시간 스트림용 샘플 비디오 경로 탐색"""
+    """구역별 실시간 스트림용 샘플 비디오 경로 탐색 (고품질 stabilization_verification 우선)"""
     candidates = [
         os.path.join(RESULTS_DIR, f"zone_{zone_id}_live.mp4"),
-        os.path.join(RESULTS_DIR, "cctv_simulation_video.mp4"),
-        os.path.join(RESULTS_DIR, "processed_cctv_20260811_223259_test_north04.mp4"),
         os.path.join(RESULTS_DIR, "stabilization_720p_fp16_verification.mp4"),
+        os.path.join(RESULTS_DIR, "stabilization_verification.mp4"),
+        os.path.join(RESULTS_DIR, "processed_cctv_20260811_223259_test_north04.mp4"),
+        os.path.join(RESULTS_DIR, "cctv_simulation_video.mp4"),
         os.path.join(BASE_DIR, "cctv_simulation_video.mp4"),
         "e:/AIVLE_10team/TDTC-AI-FE/dist/cctv_mangwon_live.mp4",
-        "e:/AIVLE_10team/ai_pipeline/results/cctv_simulation_video.mp4",
+        "e:/AIVLE_10team/ai_pipeline/results/stabilization_720p_fp16_verification.mp4",
+        "e:/AIVLE_10team/ai_pipeline/results/stabilization_verification.mp4",
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -63,9 +65,6 @@ async def generate_mjpeg_stream(zone_id: int):
 
             if frame.shape[0] != 720 or frame.shape[1] != 1280:
                 frame = cv2.resize(frame, (1280, 720))
-
-            cv2.putText(frame, f"ZONE {zone_id} LIVE", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 128), 2)
-            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
             _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
             frame_bytes = buffer.tobytes()
