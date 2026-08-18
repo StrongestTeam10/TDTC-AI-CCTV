@@ -1,0 +1,46 @@
+# run_ai_server.ps1 (TDTC-AI-CCTV)
+$Host.UI.RawUI.WindowTitle = "TDTC CCTV AI Server + Cloudflare Tunnel"
+
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "  [TDTC CCTV AI] FastAPI Server + Cloudflare Tunnel Start " -ForegroundColor Cyan
+Write-Host "  Domain : https://tdtc-ai-cctv.uk" -ForegroundColor Yellow
+Write-Host "==========================================================" -ForegroundColor Cyan
+
+# 1. FastAPI 서버 백그라운드 창에서 실행 (Port 8088)
+Write-Host "[1/2] FastAPI AI Server Starting (Port: 8088)..." -ForegroundColor Green
+$SERVER_CMD = "Set-Location 'e:\AIVLE_10team\TDTC-AI-CCTV'; python ai_server.py"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", $SERVER_CMD
+
+# 서버가 포트(8088)를 완전히 바인딩할 때까지 5초 대기
+Start-Sleep -Seconds 5
+
+# 2. Cloudflare 영구 고정 터널 실행 (tdtc-ai-cctv.uk)
+Write-Host "[2/2] Cloudflare Tunnel Connecting (https://tdtc-ai-cctv.uk)..." -ForegroundColor Cyan
+
+# .env에서 토큰 파싱
+$TOKEN = $env:CLOUDFLARE_TUNNEL_TOKEN
+if (-not $TOKEN -and (Test-Path "e:\AIVLE_10team\TDTC-AI-CCTV\.env")) {
+    Get-Content "e:\AIVLE_10team\TDTC-AI-CCTV\.env" | ForEach-Object {
+        if ($_ -match "^\s*CLOUDFLARE_TUNNEL_TOKEN\s*=\s*(.+)$") {
+            $TOKEN = $matches[1].Trim()
+        }
+    }
+}
+
+if (-not $TOKEN) {
+    Write-Host "[Warning] CLOUDFLARE_TUNNEL_TOKEN이 .env에 설정되지 않았습니다." -ForegroundColor Red
+}
+
+$CLOUDFLARED_CMD = "cloudflared"
+if (Test-Path "C:\Program Files (x86)\cloudflared\cloudflared.exe") {
+    $CLOUDFLARED_CMD = "C:\Program Files (x86)\cloudflared\cloudflared.exe"
+}
+if (Test-Path "C:\Program Files\cloudflared\cloudflared.exe") {
+    $CLOUDFLARED_CMD = "C:\Program Files\cloudflared\cloudflared.exe"
+}
+
+if ($TOKEN) {
+    & $CLOUDFLARED_CMD tunnel run --token $TOKEN
+} else {
+    Write-Host "[Error] Cloudflare Tunnel Token이 없어 터널을 구동할 수 없습니다." -ForegroundColor Red
+}
