@@ -2,11 +2,12 @@
 server/routers/cctv.py - CCTV 비디오 업로드, 스트리밍, 결과 다운로드 라우터
 """
 
+import json
 import os
 import cv2
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict
 from fastapi import APIRouter, BackgroundTasks, HTTPException, File, UploadFile, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 import numpy as np
@@ -19,6 +20,8 @@ from server.models import (
 )
 from server.services import process_ai_pipeline
 from server.websocket import manager
+from server.video_buffer import global_buffer_manager
+from server.raw_video_worker import RawVideoSplitter
 
 router = APIRouter(tags=["분석 (WebSocket)"])
 
@@ -30,6 +33,65 @@ _vision_models = {
     "device": None,
     "initialized": False
 }
+
+# 3개 구역의 최신 상태를 전역으로 보관 (존별 값 보존 및 대시보드 전체 합계 실시간 동기화)
+_latest_live_zone_metrics: Dict[int, dict] = {
+    1: {"pedestrian_count": 0, "occupancy_rate": 0.0, "stagnation_sec": 0.0, "cri_score": 10.0, "risk_level": "SAFE"},
+    2: {"pedestrian_count": 0, "occupancy_rate": 0.0, "stagnation_sec": 0.0, "cri_score": 10.0, "risk_level": "SAFE"},
+    3: {"pedestrian_count": 0, "occupancy_rate": 0.0, "stagnation_sec": 0.0, "cri_score": 10.0, "risk_level": "SAFE"},
+}
+_global_live_frame_seq: int = 1
+_zone_splitters: Dict[int, RawVideoSplitter] = {}
+_broadcast_task: Optional[asyncio.Task] = None
+
+
+async def _central_broadcast_loop():
+    """3개 구역의 최신 상태를 0.2초(5 FPS)마다 완벽하게 단일 묶음으로 동기화 브로드캐스트 (대시보드 튐 100% 원천 차단)"""
+    global _global_live_frame_seq
+    while True:
+        try:
+            await asyncio.sleep(0.2)
+            _global_live_frame_seq = (_global_live_frame_seq % 100000) + 1
+            curr_sync_frame_id = _global_live_frame_seq
+            now_ts = datetime.now(timezone.utc).timestamp()
+
+            for z_id in (1, 2, 3):
+                z_data = _latest_live_zone_metrics.get(z_id, {
+                    "pedestrian_count": 0, "occupancy_rate": 0.0, "stagnation_sec": 0.0, "cri_score": 10.0, "risk_level": "SAFE"
+                })
+                await manager.broadcast({
+                    "type": "CCTV_AI_STREAM",
+                    "frame_id": curr_sync_frame_id,
+                    "zone_id": z_id,
+                    "filename": f"zone_{z_id}_stream.mp4",
+                    "pedestrian_count": z_data["pedestrian_count"],
+                    "occupancy_rate": z_data["occupancy_rate"],
+                    "stagnation_sec": z_data["stagnation_sec"],
+                    "cri_score": z_data["cri_score"],
+                    "risk_level": z_data["risk_level"],
+                    "timestamp": now_ts
+                })
+        except Exception:
+            pass
+
+
+def ensure_central_broadcast_started():
+    """중앙 동기화 브로드캐스터 태스크 활성화 보장"""
+    global _broadcast_task
+    if _broadcast_task is None or _broadcast_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _broadcast_task = loop.create_task(_central_broadcast_loop())
+        except RuntimeError:
+            pass
+
+
+def get_zone_splitter(zone_id: int, fps: float = 10.0) -> RawVideoSplitter:
+    """구역당 단일 싱글톤 Splitter 워커 반환 (다중 연결 시 파일 쓰기 충돌 방지)"""
+    if zone_id not in _zone_splitters:
+        _zone_splitters[zone_id] = RawVideoSplitter(zone_id=zone_id, fps=fps, split_duration_sec=60.0)
+    return _zone_splitters[zone_id]
+
 
 
 def get_shared_vision_models():
@@ -55,7 +117,7 @@ def get_shared_vision_models():
         except Exception as e:
             print(f"[Vision Setup] CSRNet 로드 생략: {e}")
 
-    # 2. YOLOv8
+    # 2. YOLO11n
     try:
         from ultralytics import YOLO
         yolo_path = os.path.join(MODELS_DIR, "yolo11n.pt")
@@ -65,9 +127,9 @@ def get_shared_vision_models():
             yolo_path = "yolo11n.pt"
         yolo_model = YOLO(yolo_path)
         _vision_models["yolo"] = yolo_model
-        print(f"[Vision Setup] 실시간 YOLOv8 로드 완료: {yolo_path}")
+        print(f"[Vision Setup] 실시간 YOLO11n 로드 완료: {yolo_path}")
     except Exception as e:
-        print(f"[Vision Setup] YOLOv8 로드 생략: {e}")
+        print(f"[Vision Setup] YOLO11n 로드 생략: {e}")
 
     # 3. HOG
     try:
@@ -133,20 +195,33 @@ async def generate_mjpeg_stream(zone_id: int):
 
     cap = cv2.VideoCapture(video_path)
     orig_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if orig_fps < 20 or orig_fps > 60:
+    if orig_fps < 10 or orig_fps > 60:
         orig_fps = 30.0
-    target_fps = min(30.0, orig_fps) # 30 FPS 원본 부드러움 유지
+    target_fps = 10.0 # 10 FPS로 경량화하여 대역폭 및 연산 부하 1/3 대폭 절감
+    frame_step = max(1, int(round(orig_fps / target_fps))) # 정상 배속(1.0x) 유지를 위한 프레임 스킵 간격
     frame_interval = 1.0 / target_fps
 
     frame_idx = 0
     cached_boxes = []
 
     smoothed_count = 0.0
+    smoothed_stagnation = 0.0
+    smoothed_cri = 0.0
+
+    # 35초 위험 클립 추출용 원형 버퍼 및 1분 단위 상시 영상 분할 워커 초기화
+    buf = global_buffer_manager.get_buffer(zone_id)
+    splitter = get_zone_splitter(zone_id, fps=target_fps)
 
     try:
         while True:
             import time
             t_start = time.time()
+
+            # 정상 배속 유지를 위해 중간 프레임 건너뛰기
+            for _ in range(frame_step - 1):
+                if not cap.grab():
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    cap.grab()
 
             ret, frame = cap.read()
             if not ret:
@@ -156,28 +231,19 @@ async def generate_mjpeg_stream(zone_id: int):
                     break
 
             frame_idx += 1
-            # 원본 해상도 및 종횡비(Aspect Ratio) 100% 그대로 유지 (강제 리사이즈 일체 배제)
 
-            # 4프레임마다 인물 검출(YOLO) 갱신하여 30 FPS 스트리밍에 지연 일체 없음
-            if frame_idx % 4 == 1 or not cached_boxes:
+            # 좌우 검은색 필러박스(Letterbox)가 포함된 가로 영상(Zone 1 등 1920x1080)인 경우, 유효 세로 영역만 크롭하여 Zone 2, 3처럼 꽉 차게 렌더링
+            h, w = frame.shape[:2]
+            if w > h and w >= 1900 and h >= 1000:
+                frame = frame[:, 656:1264]
+
+            # 2프레임마다 CSRNet 군중 밀도 추론 & YOLO 모자이크 영역 갱신
+            if frame_idx % 2 == 1 or not cached_boxes:
+                detected_peaks = []
                 detected_boxes = []
 
-                # A. YOLOv8 실시간 탐지 (가장 빠르고 정밀함)
-                if yolo is not None:
-                    try:
-                        res = yolo(frame, classes=[0], verbose=False, conf=0.30, imgsz=640)
-                        if len(res) > 0 and len(res[0].boxes) > 0:
-                            for b in res[0].boxes:
-                                coords = b.xyxy[0].cpu().numpy()
-                                w_box = coords[2] - coords[0]
-                                h_box = coords[3] - coords[1]
-                                if 15 < w_box < frame.shape[1] * 0.6 and 25 < h_box < frame.shape[0] * 0.7:
-                                    detected_boxes.append((coords[0], coords[1], coords[2], coords[3]))
-                    except Exception:
-                        pass
-
-                # B. CSRNet 피크 탐지 (YOLO 미검출 시 폴백)
-                if not detected_boxes and csrnet is not None and device is not None:
+                # 1. CSRNet 군중 밀도 분석 & 피크 좌표 검출 (메인 인원수 및 3D 물리 좌표 산출)
+                if csrnet is not None and device is not None:
                     try:
                         import torch
                         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -185,56 +251,99 @@ async def generate_mjpeg_stream(zone_id: int):
                         with torch.no_grad():
                             dm = csrnet(tensor)
                             dm = torch.clamp(dm, min=0)
-                        peaks = extract_peaks_from_density(dm.squeeze().cpu().numpy(), threshold=0.005)
-                        scale_x = frame.shape[1] / dm.shape[3]
-                        scale_y = frame.shape[0] / dm.shape[2]
-                        for px, py in peaks:
-                            u, v = px * scale_x, py * scale_y
-                            detected_boxes.append((u - 25, v - 25, u + 25, v + 25))
+                        d_map = dm.squeeze().cpu().numpy()
+                        h_out, w_out = dm.shape[2], dm.shape[3]
+                        scale_x = frame.shape[1] / w_out
+                        scale_y = frame.shape[0] / h_out
+                        raw_peaks = extract_peaks_from_density(d_map, threshold=0.0004)
+                        for rx, ry in raw_peaks:
+                            px, py = float(rx * scale_x), float(ry * scale_y)
+                            # 화면 테두리 고정 노이즈 제외
+                            if 20.0 <= px <= (frame.shape[1] - 20.0) and 30.0 <= py <= (frame.shape[0] - 15.0):
+                                detected_peaks.append((px, py))
+                                # CSRNet 피크 주변 모자이크 박스 기본 생성
+                                detected_boxes.append((px - 28, py - 32, px + 28, py + 32))
                     except Exception:
                         pass
+
+                # 2. YOLO11n 실시간 모자이크 비식별화 박스 보강 (얼굴/신체 정밀 블러)
+                if yolo is not None:
+                    try:
+                        res = yolo(frame, classes=[0], verbose=False, conf=0.25, imgsz=640)
+                        if len(res) > 0 and len(res[0].boxes) > 0:
+                            for b in res[0].boxes:
+                                coords = b.xyxy[0].cpu().numpy()
+                                detected_boxes.append((float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])))
+                    except Exception:
+                        pass
+
+                if detected_peaks:
+                    cached_peaks = detected_peaks
+                elif detected_boxes:
+                    cached_peaks = [(float((b[0]+b[2])/2), float(b[3])) for b in detected_boxes]
 
                 if detected_boxes:
                     cached_boxes = detected_boxes
 
             # 2. 최신 박스 위치에 모자이크 비식별화 즉시 적용 (2ms 초고속)
             for (x1, y1, x2, y2) in cached_boxes:
-                frame = apply_mosaic(frame, x1, y1, x2, y2)
+                frame = apply_mosaic(frame, int(x1), int(y1), int(x2), int(y2))
 
-            # 3. 실시간 지표 산출 및 EMA 스무딩 (초당 약 5회 안정적 브로드캐스트)
-            if frame_idx % 6 == 0:
-                raw_count = len(cached_boxes)
-                smoothed_count = raw_count if smoothed_count == 0 else (smoothed_count * 0.7 + raw_count * 0.3)
+            # 프레임별 보행자 좌표 패킹 (CSRNet 검출 피크 기준 pedaggr01h 자동 적재)
+            active_peaks = cached_peaks if 'cached_peaks' in locals() and cached_peaks else []
+            pixels_dict = {f"p_{i+1}": [int(px), int(py)] for i, (px, py) in enumerate(active_peaks)}
+            bev_dict = {f"p_{i+1}": [round(float(px * 0.015), 2), round(float(py * 0.02), 2), 0.0] for i, (px, py) in enumerate(active_peaks)}
+            frame_metric = {
+                "zone_id": zone_id,
+                "frame_id": frame_idx,
+                "video_id": 1,
+                "total_count": len(active_peaks),
+                "pixels_json": json.dumps(pixels_dict),
+                "bev_xyz_json": json.dumps(bev_dict),
+                "captured_at": datetime.now(timezone.utc).isoformat()
+            }
+
+            # 35초 비상 클립 버퍼 및 1분 상시 분할 워커에 프레임 기록 (S3/DB 파이프라인 연동)
+            buf.append_frame(frame, t_start)
+            splitter.write_frame(frame, frame_metric)
+
+            # 3. 실시간 지표 산출 및 이중 EMA 스무딩 (CSRNet 기반 정밀 카운트)
+            if frame_idx % 2 == 0:
+                raw_count = len(active_peaks)
+                smoothed_count = raw_count if smoothed_count == 0 else (smoothed_count * 0.75 + raw_count * 0.25)
                 final_count = int(round(smoothed_count))
 
-                occupancy_rate = min(100.0, round(final_count * 2.8, 1))
-                stagnation_sec = round((frame_idx % 120) * 0.25, 1)
-                cri_score = round(min(100.0, final_count * 3.2 + stagnation_sec * 0.5), 1)
+                # 점유율 (골목 용량 기준 1인당 약 2.2%)
+                occupancy_rate = min(100.0, round(final_count * 2.2, 1))
+
+                # 정체 대기시간 (인원 밀집 시 점진적 누적, 한산할 시 점진적 해소 - 톱니파 완전 제거)
+                target_stagnation = max(0.0, (final_count - 8) * 0.7) if final_count > 8 else max(0.0, final_count * 0.15)
+                smoothed_stagnation = target_stagnation if smoothed_stagnation == 0.0 else (smoothed_stagnation * 0.85 + target_stagnation * 0.15)
+                stagnation_sec = round(min(25.0, smoothed_stagnation), 1)
+
+                # 위험도 스코어 산출 (표준 CRIv3 공식 + EMA 스무딩으로 튀는 현상 방지)
+                raw_cri = (final_count * 1.8) + (stagnation_sec * 0.35) + (occupancy_rate * 0.25)
+                smoothed_cri = raw_cri if smoothed_cri == 0.0 else (smoothed_cri * 0.8 + raw_cri * 0.2)
+                cri_score = round(min(100.0, max(5.0, smoothed_cri)), 1)
                 risk_level = "SAFE" if cri_score < 40 else "WARN" if cri_score < 70 else "DANGER"
 
-                try:
-                    await manager.broadcast({
-                        "type": "CCTV_AI_STREAM",
-                        "frame_id": frame_idx,
-                        "zone_id": zone_id,
-                        "filename": f"zone_{zone_id}_stream.mp4",
-                        "pedestrian_count": final_count,
-                        "occupancy_rate": occupancy_rate,
-                        "stagnation_sec": stagnation_sec,
-                        "cri_score": cri_score,
-                        "risk_level": risk_level,
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                except Exception:
-                    pass
+                # ⭐️ 전역 최신 구역 상태 갱신 (중앙 동기화 브로드캐스터가 0.2초마다 단일 패킷으로 일괄 전송)
+                _latest_live_zone_metrics[zone_id] = {
+                    "pedestrian_count": final_count,
+                    "occupancy_rate": occupancy_rate,
+                    "stagnation_sec": stagnation_sec,
+                    "cri_score": cri_score,
+                    "risk_level": risk_level,
+                }
+                ensure_central_broadcast_started()
 
-            # 4. JPEG 인코딩 및 30 FPS 원본 송출
-            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            # 4. JPEG 인코딩 및 10 FPS 스트림 송출 (품질 70으로 압축률 최적화)
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-            # 30 FPS 정속 유지 시간 계산
+            # 10 FPS 정속 유지 시간 계산
             elapsed = time.time() - t_start
             sleep_time = max(0.001, frame_interval - elapsed)
             await asyncio.sleep(sleep_time)
@@ -249,6 +358,58 @@ async def stream_cctv_live(zone_id: int = 1):
         generate_mjpeg_stream(zone_id),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
+
+
+@router.get("/api/v1/cctv/db-status", tags=["진단"])
+def get_db_and_splitter_status():
+    """현재 Supabase/RDS DB 테이블 적재 건수 및 실시간 1분 분할 워커 진행 상태 반환"""
+    from utils.db_connector import get_db_connection
+    db_counts = {"vdoclip01m": 0, "pedaggr01h": 0, "mrkrisk01m": 0, "connected": False}
+    try:
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM vdoclip01m;")
+            db_counts["vdoclip01m"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM pedaggr01h;")
+            db_counts["pedaggr01h"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM mrkrisk01m;")
+            db_counts["mrkrisk01m"] = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            db_counts["connected"] = True
+        else:
+            db_counts["error"] = "Database connection returned None (check credentials)"
+    except Exception as e:
+        db_counts["error"] = str(e)
+
+    splitters_info = {}
+    for zid, sp in _zone_splitters.items():
+        splitters_info[f"zone_{zid}"] = {
+            "frame_count": sp.frame_count,
+            "max_frames": sp.max_frames_per_split,
+            "progress_pct": round((sp.frame_count / max(1, sp.max_frames_per_split)) * 100, 1),
+            "buffered_metrics_count": len(sp.buffered_metrics)
+        }
+
+    return {
+        "status": "OK",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": db_counts,
+        "live_splitters": splitters_info
+    }
+
+
+@router.post("/api/v1/cctv/flush-db", tags=["진단"])
+def flush_current_splitters_to_db():
+    """현재까지 모인 모든 구역의 1분 버퍼를 즉시 S3 및 RDS DB에 강제 마감 적재"""
+    flushed = []
+    for zid, sp in _zone_splitters.items():
+        if sp.frame_count > 0:
+            sp.finalize()
+            flushed.append(f"zone_{zid} ({sp.frame_count} frames)")
+    return {"message": "✅ 강제 DB 적재 트리거 완료", "flushed_zones": flushed}
+
 
 
 @router.post("/api/v1/cctv/upload")

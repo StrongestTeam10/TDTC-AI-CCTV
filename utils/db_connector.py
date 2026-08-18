@@ -24,9 +24,9 @@ def load_env():
 load_env()
 
 DB_HOST = os.environ.get("DEV_DB_HOST") or os.environ.get("DB_HOST", "aws-0-ap-northeast-1.pooler.supabase.com")
-DB_PORT = os.environ.get("DEV_DB_PORT") or os.environ.get("DB_PORT", "5432")
+DB_PORT = os.environ.get("DEV_DB_PORT") or os.environ.get("DB_PORT", "6543")
 DB_NAME = os.environ.get("DEV_DB_NAME") or os.environ.get("DB_NAME", "postgres")
-DB_USER = os.environ.get("DEV_DB_USERNAME") or os.environ.get("DB_USER", "postgres.uusnthiedfwzlcsgtnhn")
+DB_USER = os.environ.get("DEV_DB_USERNAME") or os.environ.get("DB_USER", "")
 DB_PASSWORD = os.environ.get("DEV_DB_PASSWORD") or os.environ.get("DB_PASSWORD", "")
 if not DB_PASSWORD:
     print("[WARNING] DB_PASSWORD 환경변수가 비어 있습니다. .env 파일을 확인하세요.")
@@ -34,15 +34,24 @@ if not DB_PASSWORD:
 
 def get_db_connection():
     """Supabase PostgreSQL 접속 커넥션 반환"""
-    if not DB_PASSWORD:
+    load_env()
+    host = os.environ.get("DEV_DB_HOST") or os.environ.get("DB_HOST", "aws-0-ap-northeast-1.pooler.supabase.com")
+    port = int(os.environ.get("DEV_DB_PORT") or os.environ.get("DB_PORT", "6543"))
+    dbname = os.environ.get("DEV_DB_NAME") or os.environ.get("DB_NAME", "postgres")
+    user = os.environ.get("DEV_DB_USERNAME") or os.environ.get("DB_USER", "")
+    password = os.environ.get("DEV_DB_PASSWORD") or os.environ.get("DB_PASSWORD", "")
+
+    if not user or not password:
+        print("[ERROR] DB_USER 또는 DB_PASSWORD 환경변수가 설정되지 않아 DB에 접속할 수 없습니다.")
         return None
+
     try:
         conn = psycopg2.connect(
-            host=DB_HOST,
-            port=int(DB_PORT),
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password,
             sslmode="require",
             connect_timeout=15
         )

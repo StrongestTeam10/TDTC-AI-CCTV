@@ -253,15 +253,15 @@ async def process_ai_pipeline(
         stag_metrics = centroid_tracker.get_stagnation_metrics(fps=fps)
         stagnation_sec = stag_metrics["avg_stagnation_sec"]
 
-        # 복합 위험도(CRI Score) 계산 (인원수 + 점유율 + 정체시간 가중치)
-        occupancy_rate = round(min(100.0, base_count * 2.6), 1)
-        raw_cri = 10.0 + (base_count * 2.3) + (occupancy_rate * 0.25) + (min(20.0, stagnation_sec * 1.5))
-        cri_score = round(min(100.0, max(10.0, raw_cri)), 1)
+        # 복합 위험도(CRI Score) 계산 (인원수 + 점유율 + 정체시간 표준화 가중치)
+        occupancy_rate = round(min(100.0, base_count * 2.2), 1)
+        raw_cri = (base_count * 1.8) + (occupancy_rate * 0.25) + (min(25.0, stagnation_sec * 0.35))
+        cri_score = round(min(100.0, max(5.0, raw_cri)), 1)
 
         risk_level = "NORMAL"
         if cri_score >= 70.0:
             risk_level = "EMERGENCY_EVACUATION"
-        elif cri_score >= 30.0:
+        elif cri_score >= 40.0:
             risk_level = "WARNING"
 
         # ---------------------------------------------------------------------
@@ -680,10 +680,10 @@ async def process_confirm_background(
     except Exception as e:
         print(f"[Confirm Warning] PDF 리포트 생성 중 에러: {e}")
 
-    # 3. S3 업로드 (warning-clips/ 및 report-pdfs/)
+    # 3. S3 업로드 (danger-clips/ 및 post-reports/)
     print(f"[Confirm] S3 파일 업로드 시작...")
-    s3_clip_url = upload_file_to_s3(sliced_path, f"warning-clips/{sliced_filename}")
-    s3_pdf_url = upload_file_to_s3(pdf_path, f"report-pdfs/{pdf_filename}")
+    s3_clip_url = upload_file_to_s3(sliced_path, f"danger-clips/{sliced_filename}")
+    s3_pdf_url = upload_file_to_s3(pdf_path, f"post-reports/{pdf_filename}")
     print(f"[Confirm] S3 업로드 완료. Clip URL: {s3_clip_url}, PDF URL: {s3_pdf_url}")
 
     # 로컬 임시 파일 정리

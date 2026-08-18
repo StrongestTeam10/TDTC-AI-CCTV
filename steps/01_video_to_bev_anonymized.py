@@ -49,7 +49,7 @@ CSV_SAVE_PATH = os.environ.get("CCTV_BEV_CSV", os.path.join(RESULTS_DIR, "cctv_b
 CSR_RESULT_MP4 = os.environ.get("CSR_RESULT_MP4", os.path.join(RESULTS_DIR, "cctv_result_anonymized.mp4"))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 [CSRNet + YOLOv8 -> BEV 및 모자이크 파이프라인 가동] 사용 디바이스: {device}")
+print(f"🚀 [CSRNet + YOLO11n -> BEV 및 모자이크 파이프라인 가동] 사용 디바이스: {device}")
 
 # 가우시안 모자이크 비식별화 함수
 def apply_mosaic(img, x1, y1, x2, y2):
@@ -72,11 +72,11 @@ def apply_mosaic(img, x1, y1, x2, y2):
 yolo_model = None
 if yolo_available and os.path.exists(YOLO_MODEL_PATH):
     try:
-        print(f"📂 YOLOv8 비식별화 모델 로딩 중: {YOLO_MODEL_PATH}")
+        print(f"📂 YOLO11n 비식별화 모델 로딩 중: {YOLO_MODEL_PATH}")
         yolo_model = YOLO(YOLO_MODEL_PATH)
-        print("✅ YOLOv8 모델 로딩 완벽 성공!")
+        print("✅ YOLO11n 모델 로딩 완벽 성공!")
     except Exception as e:
-        print(f"⚠️ YOLOv8 로드 경고: {e}")
+        print(f"⚠️ YOLO11n 로드 경고: {e}")
 
 
 # =========================================================================
@@ -395,7 +395,7 @@ while cap.isOpened():
         v = py_raw * scale_y
         peaks.append((u, v))
 
-    # --- [YOLOv8 기반 가우시안 모자이크 비식별화] ---
+    # --- [YOLO11n 기반 가우시안 모자이크 비식별화] ---
     frame_render = frame_720p.copy()
     if yolo_model is not None:
         try:
