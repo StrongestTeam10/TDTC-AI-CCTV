@@ -106,10 +106,11 @@ class RawVideoSplitter:
                     try:
                         for m in metrics_snapshot:
                             m["clip_id"] = created_clip_id
+                            m["s3_clip_url"] = s3_url
                         bulk_insert_pedestrian_coordinate_json(metrics_snapshot)
                         print(f"[RawVideoSplitter] Zone {self.zone_id} 1분 집계 데이터 DB 적재 완료: {len(metrics_snapshot)} frames")
                     except Exception as db_err:
-                        print(f"[RawVideoSplitter Warning] pedaggr01h DB 적재 중 에러: {db_err}")
+                        print(f"[RawVideoSplitter Warning] pedaggr01h / mrkrisk01m DB 적재 중 에러: {db_err}")
 
                 # 4. 로컬 임시 파일 정리
                 try:

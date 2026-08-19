@@ -13,8 +13,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 import numpy as np
 
 from server.config import (
-    BASE_DIR, TEMP_UPLOAD_DIR, UPLOAD_DIR, RESULTS_DIR, MODELS_DIR, pipeline_state
+    BASE_DIR, TEMP_UPLOAD_DIR, UPLOAD_DIR, RESULTS_DIR, MODELS_DIR, CACHE_DIR, pipeline_state
 )
+from server.s3_uploader import download_file_from_s3
 from server.models import (
     torch_available, CSRNet, csr_transform, extract_peaks_from_density, apply_mosaic
 )
@@ -144,8 +145,26 @@ def get_shared_vision_models():
 
 
 def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
-    """구역별(zone_id 1, 2, 3) 실시간 스트림용 샘플 비디오 경로 탐색"""
-    # 1. zone/zone_id{zone_id} 폴더 내의 비디오 최우선 탐색
+    """
+    구역별(zone_id 1, 2, 3) 실시간 스트림용 원본 비디오 경로 탐색 및 S3 자동 캐싱:
+    1. 로컬 캐시(cctv_cache/zone{zone_id}_source.mp4) 최우선 확인
+    2. 로컬 캐시가 없으면 AWS S3(source-videos/zone{zone_id}_source.mp4)에서 자동 다운로드
+    3. 로컬 zone/ 폴더 또는 results/ 폴더 fallback 탐색
+    """
+    # 1. 로컬 캐시 확인
+    cached_path = os.path.join(CACHE_DIR, f"zone{zone_id}_source.mp4")
+    if os.path.exists(cached_path) and os.path.getsize(cached_path) > 10000:
+        return cached_path
+
+    # 2. AWS S3에서 원본 비디오 자동 다운로드
+    s3_key = f"source-videos/zone{zone_id}_source.mp4"
+    print(f"[Zone {zone_id} Stream] 로컬 캐시 없음 -> S3 ({s3_key}) 자동 다운로드 시도...")
+    download_success = download_file_from_s3(s3_key, cached_path)
+    if download_success and os.path.exists(cached_path) and os.path.getsize(cached_path) > 10000:
+        print(f"[Zone {zone_id} Stream] S3 원본 비디오 캐싱 완료: {cached_path}")
+        return cached_path
+
+    # 3. 로컬 zone/zone_id{zone_id} 폴더 fallback 탐색
     candidates_zone_dirs = [
         os.path.join(BASE_DIR, "..", "zone", f"zone_id{zone_id}"),
         os.path.join(BASE_DIR, "zone", f"zone_id{zone_id}"),
@@ -158,7 +177,7 @@ def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
                     v_path = os.path.join(z_dir, fname)
                     return v_path
 
-    # 2. results 폴더 내 구역 파일 탐색
+    # 4. results 폴더 내 구역 파일 fallback 탐색
     candidates = [
         os.path.join(RESULTS_DIR, f"zone_{zone_id}_live.mp4"),
         os.path.join(RESULTS_DIR, "stabilization_720p_fp16_verification.mp4"),
@@ -166,7 +185,6 @@ def find_sample_video_for_zone(zone_id: int) -> Optional[str]:
         os.path.join(RESULTS_DIR, "processed_cctv_20260811_223259_test_north04.mp4"),
         os.path.join(RESULTS_DIR, "cctv_simulation_video.mp4"),
         os.path.join(BASE_DIR, "cctv_simulation_video.mp4"),
-        "e:/AIVLE_10team/TDTC-AI-FE/dist/cctv_mangwon_live.mp4",
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -195,14 +213,20 @@ async def generate_mjpeg_stream(zone_id: int):
 
     cap = cv2.VideoCapture(video_path)
     orig_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if orig_fps < 10 or orig_fps > 60:
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1800
+    if orig_fps < 10 or orig_fps > 120:
         orig_fps = 30.0
-    target_fps = 10.0 # 10 FPS로 경량화하여 대역폭 및 연산 부하 1/3 대폭 절감
-    frame_step = max(1, int(round(orig_fps / target_fps))) # 정상 배속(1.0x) 유지를 위한 프레임 스킵 간격
-    frame_interval = 1.0 / target_fps
+    
+    # ⭐️ [30 FPS 고주사율 & 1.0x 정상 배속]
+    # Zone 1 (60fps -> 30fps): 2스텝 (1초에 60프레임치 정상 진행)
+    # Zone 2/3 (30fps -> 30fps): 1스텝 (1초에 30프레임치 정상 진행)
+    target_stream_fps = 30.0
+    frame_interval = 1.0 / target_stream_fps
+    frame_step = max(1, int(round(orig_fps / target_stream_fps)))
 
     frame_idx = 0
     cached_boxes = []
+    cached_peaks = []
 
     smoothed_count = 0.0
     smoothed_stagnation = 0.0
@@ -210,7 +234,7 @@ async def generate_mjpeg_stream(zone_id: int):
 
     # 35초 위험 클립 추출용 원형 버퍼 및 1분 단위 상시 영상 분할 워커 초기화
     buf = global_buffer_manager.get_buffer(zone_id)
-    splitter = get_zone_splitter(zone_id, fps=target_fps)
+    splitter = get_zone_splitter(zone_id, fps=target_stream_fps)
 
     try:
         while True:
@@ -218,37 +242,43 @@ async def generate_mjpeg_stream(zone_id: int):
             t_start = time.time()
 
             # 정상 배속 유지를 위해 중간 프레임 건너뛰기
-            for _ in range(frame_step - 1):
-                if not cap.grab():
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    cap.grab()
+            if frame_step > 1:
+                for _ in range(frame_step - 1):
+                    if not cap.grab():
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        cap.grab()
 
             ret, frame = cap.read()
             if not ret:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    # 안전 재시도
+                    cap.release()
+                    cap = cv2.VideoCapture(video_path)
+                    ret, frame = cap.read()
+                    if not ret:
+                        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 
             frame_idx += 1
 
-            # 좌우 검은색 필러박스(Letterbox)가 포함된 가로 영상(Zone 1 등 1920x1080)인 경우, 유효 세로 영역만 크롭하여 Zone 2, 3처럼 꽉 차게 렌더링
+            # 좌우 검은색 필러박스 크롭 (가로 영상 꽉 차게)
             h, w = frame.shape[:2]
             if w > h and w >= 1900 and h >= 1000:
                 frame = frame[:, 656:1264]
 
-            # 2프레임마다 CSRNet 군중 밀도 추론 & YOLO 모자이크 영역 갱신
-            if frame_idx % 2 == 1 or not cached_boxes:
+            # 4프레임마다 1회 딥러닝 추론 수행 (30 FPS 방어)
+            if frame_idx % 4 == 1 or not cached_boxes:
                 detected_peaks = []
                 detected_boxes = []
 
-                # 1. CSRNet 군중 밀도 분석 & 피크 좌표 검출 (메인 인원수 및 3D 물리 좌표 산출)
+                # 1. CSRNet 군중 밀도 분석 & 피크 좌표 검출 (인원수 및 3D 물리 좌표 산출)
                 if csrnet is not None and device is not None:
                     try:
                         import torch
                         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         tensor = csr_transform(img_rgb).unsqueeze(0).to(device)
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             dm = csrnet(tensor)
                             dm = torch.clamp(dm, min=0)
                         d_map = dm.squeeze().cpu().numpy()
@@ -258,18 +288,17 @@ async def generate_mjpeg_stream(zone_id: int):
                         raw_peaks = extract_peaks_from_density(d_map, threshold=0.0004)
                         for rx, ry in raw_peaks:
                             px, py = float(rx * scale_x), float(ry * scale_y)
-                            # 화면 테두리 고정 노이즈 제외
                             if 20.0 <= px <= (frame.shape[1] - 20.0) and 30.0 <= py <= (frame.shape[0] - 15.0):
                                 detected_peaks.append((px, py))
-                                # CSRNet 피크 주변 모자이크 박스 기본 생성
+                                # CSRNet 피크 주변 모자이크 박스 기본 생성 (원복)
                                 detected_boxes.append((px - 28, py - 32, px + 28, py + 32))
                     except Exception:
                         pass
 
-                # 2. YOLO11n 실시간 모자이크 비식별화 박스 보강 (얼굴/신체 정밀 블러)
+                # 2. YOLO11n 실시간 보행자 비식별화 박스 검출 (원복)
                 if yolo is not None:
                     try:
-                        res = yolo(frame, classes=[0], verbose=False, conf=0.25, imgsz=640)
+                        res = yolo(frame, classes=[0], verbose=False, conf=0.25, imgsz=384)
                         if len(res) > 0 and len(res[0].boxes) > 0:
                             for b in res[0].boxes:
                                 coords = b.xyxy[0].cpu().numpy()
@@ -285,12 +314,37 @@ async def generate_mjpeg_stream(zone_id: int):
                 if detected_boxes:
                     cached_boxes = detected_boxes
 
-            # 2. 최신 박스 위치에 모자이크 비식별화 즉시 적용 (2ms 초고속)
+            # 2. 모자이크 비식별화 즉시 적용
             for (x1, y1, x2, y2) in cached_boxes:
                 frame = apply_mosaic(frame, int(x1), int(y1), int(x2), int(y2))
 
-            # 프레임별 보행자 좌표 패킹 (CSRNet 검출 피크 기준 pedaggr01h 자동 적재)
-            active_peaks = cached_peaks if 'cached_peaks' in locals() and cached_peaks else []
+            # 3. 실시간 지표 산출 및 이중 EMA 스무딩
+            raw_count = len(active_peaks) if 'active_peaks' in locals() else len(cached_peaks)
+            smoothed_count = raw_count if smoothed_count == 0 else (smoothed_count * 0.75 + raw_count * 0.25)
+            final_count = int(round(smoothed_count))
+
+            occupancy_rate = min(100.0, round(final_count * 2.2, 1))
+            target_stagnation = max(0.0, (final_count - 8) * 0.7) if final_count > 8 else max(0.0, final_count * 0.15)
+            smoothed_stagnation = target_stagnation if smoothed_stagnation == 0.0 else (smoothed_stagnation * 0.85 + target_stagnation * 0.15)
+            stagnation_sec = round(min(25.0, smoothed_stagnation), 1)
+
+            raw_cri = (final_count * 1.8) + (stagnation_sec * 0.35) + (occupancy_rate * 0.25)
+            smoothed_cri = raw_cri if smoothed_cri == 0.0 else (smoothed_cri * 0.8 + raw_cri * 0.2)
+            cri_score = round(min(100.0, max(5.0, smoothed_cri)), 1)
+            risk_level = "SAFE" if cri_score < 40 else "WARN" if cri_score < 70 else "DANGER"
+
+            # 전역 최신 구역 상태 갱신 (WebSocket 브로드캐스터 연동)
+            _latest_live_zone_metrics[zone_id] = {
+                "pedestrian_count": final_count,
+                "occupancy_rate": occupancy_rate,
+                "stagnation_sec": stagnation_sec,
+                "cri_score": cri_score,
+                "risk_level": risk_level,
+            }
+            ensure_central_broadcast_started()
+
+            # 프레임별 보행자 좌표 및 AI 지표 패킹
+            active_peaks = cached_peaks if cached_peaks else []
             pixels_dict = {f"p_{i+1}": [int(px), int(py)] for i, (px, py) in enumerate(active_peaks)}
             bev_dict = {f"p_{i+1}": [round(float(px * 0.015), 2), round(float(py * 0.02), 2), 0.0] for i, (px, py) in enumerate(active_peaks)}
             frame_metric = {
@@ -298,54 +352,34 @@ async def generate_mjpeg_stream(zone_id: int):
                 "frame_id": frame_idx,
                 "video_id": 1,
                 "total_count": len(active_peaks),
+                "occupancy_rate": occupancy_rate,
+                "stagnation_sec": stagnation_sec,
+                "cri_score": cri_score,
+                "risk_level": risk_level,
                 "pixels_json": json.dumps(pixels_dict),
                 "bev_xyz_json": json.dumps(bev_dict),
                 "captured_at": datetime.now(timezone.utc).isoformat()
             }
 
-            # 35초 비상 클립 버퍼 및 1분 상시 분할 워커에 프레임 기록 (S3/DB 파이프라인 연동)
+            # 35초 비상 클립 버퍼 및 1분 상시 분할 워커에 프레임 기록
             buf.append_frame(frame, t_start)
             splitter.write_frame(frame, frame_metric)
 
-            # 3. 실시간 지표 산출 및 이중 EMA 스무딩 (CSRNet 기반 정밀 카운트)
-            if frame_idx % 2 == 0:
-                raw_count = len(active_peaks)
-                smoothed_count = raw_count if smoothed_count == 0 else (smoothed_count * 0.75 + raw_count * 0.25)
-                final_count = int(round(smoothed_count))
+            # 4. ⭐️ [30 FPS 최적화] 가로 540px + JPEG 품질 68
+            fh, fw = frame.shape[:2]
+            target_w = 540
+            disp_h = int(fh * (float(target_w) / fw))
+            disp_frame = cv2.resize(frame, (target_w, disp_h), interpolation=cv2.INTER_LINEAR)
 
-                # 점유율 (골목 용량 기준 1인당 약 2.2%)
-                occupancy_rate = min(100.0, round(final_count * 2.2, 1))
-
-                # 정체 대기시간 (인원 밀집 시 점진적 누적, 한산할 시 점진적 해소 - 톱니파 완전 제거)
-                target_stagnation = max(0.0, (final_count - 8) * 0.7) if final_count > 8 else max(0.0, final_count * 0.15)
-                smoothed_stagnation = target_stagnation if smoothed_stagnation == 0.0 else (smoothed_stagnation * 0.85 + target_stagnation * 0.15)
-                stagnation_sec = round(min(25.0, smoothed_stagnation), 1)
-
-                # 위험도 스코어 산출 (표준 CRIv3 공식 + EMA 스무딩으로 튀는 현상 방지)
-                raw_cri = (final_count * 1.8) + (stagnation_sec * 0.35) + (occupancy_rate * 0.25)
-                smoothed_cri = raw_cri if smoothed_cri == 0.0 else (smoothed_cri * 0.8 + raw_cri * 0.2)
-                cri_score = round(min(100.0, max(5.0, smoothed_cri)), 1)
-                risk_level = "SAFE" if cri_score < 40 else "WARN" if cri_score < 70 else "DANGER"
-
-                # ⭐️ 전역 최신 구역 상태 갱신 (중앙 동기화 브로드캐스터가 0.2초마다 단일 패킷으로 일괄 전송)
-                _latest_live_zone_metrics[zone_id] = {
-                    "pedestrian_count": final_count,
-                    "occupancy_rate": occupancy_rate,
-                    "stagnation_sec": stagnation_sec,
-                    "cri_score": cri_score,
-                    "risk_level": risk_level,
-                }
-                ensure_central_broadcast_started()
-
-            # 4. JPEG 인코딩 및 10 FPS 스트림 송출 (품질 70으로 압축률 최적화)
-            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            # 품질 68로 경량 고속 30 FPS 스트림 송출
+            _, buffer = cv2.imencode('.jpg', disp_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 68])
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-            # 10 FPS 정속 유지 시간 계산
+            # 30 FPS 정속 유지 및 비동기 스케줄링
             elapsed = time.time() - t_start
-            sleep_time = max(0.001, frame_interval - elapsed)
+            sleep_time = max(0.002, frame_interval - elapsed)
             await asyncio.sleep(sleep_time)
     finally:
         cap.release()

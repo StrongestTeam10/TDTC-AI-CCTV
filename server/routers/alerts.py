@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from server.config import (
-    BACKEND_URL, BACKEND_API_KEY, RESULTS_DIR, BASE_DIR
+    BACKEND_URL, BACKEND_API_KEY, RESULTS_DIR, BASE_DIR, CACHE_DIR
 )
 from server.s3_uploader import upload_file_to_s3
 from server.video_buffer import global_buffer_manager
@@ -65,9 +65,10 @@ def trigger_alert(payload: AlertTriggerPayload):
         is_cut_success = True
         print(f"  [1/4] 원형 버퍼로부터 35초 위험 클립 추출 성공: {sliced_path}")
     else:
-        # 버퍼에 충분한 프레임이 없을 경우 로컬 테스트 비디오에서 35초 슬라이싱 fallback
-        print(f"  [1/4] 원형 버퍼 프레임 부족 -> 로컬 비디오 파일에서 35초 컷팅 시도")
+        # 버퍼에 충분한 프레임이 없을 경우 원본 비디오 파일에서 35초 슬라이싱 fallback
+        print(f"  [1/4] 원형 버퍼 프레임 부족 -> 원본 비디오 파일에서 35초 컷팅 시도")
         fallback_videos = [
+            os.path.join(CACHE_DIR, f"zone{zone_id}_source.mp4"),
             os.path.join(BASE_DIR, "test", f"test_south0{zone_id}.mp4"),
             os.path.join(BASE_DIR, "test", f"test0{zone_id}.mp4"),
             os.path.join(BASE_DIR, "test", "test_south01.mp4"),

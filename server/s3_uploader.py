@@ -72,3 +72,27 @@ def upload_file_to_s3(local_file_path: str, s3_key: str = None) -> str:
     except Exception as e:
         print(f"[S3 Error] S3 업로드 중 에러: {e}")
         return f"https://{bucket}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+
+
+def download_file_from_s3(s3_key: str, local_target_path: str) -> bool:
+    """
+    AWS S3 버킷에서 파일을 다운로드하여 로컬 경로에 저장합니다.
+    """
+    s3_key = s3_key.replace("\\", "/")
+    s3_client = get_s3_client()
+    bucket = S3_BUCKET_NAME or "tdtc-cctv-upload"
+
+    if s3_client is None:
+        print(f"[S3 Warning] S3 클라이언트를 사용할 수 없어 다운로드를 건너뜁니다: {s3_key}")
+        return False
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(local_target_path)), exist_ok=True)
+        print(f"[S3 Download] s3://{bucket}/{s3_key} -> '{local_target_path}' 다운로드 시작...")
+        s3_client.download_file(bucket, s3_key, local_target_path)
+        print(f"[S3 Download 완료] '{local_target_path}' 저장 완료 ({os.path.getsize(local_target_path) / (1024*1024):.2f} MB)")
+        return True
+    except Exception as e:
+        print(f"[S3 Download Error] s3://{bucket}/{s3_key} 다운로드 실패: {e}")
+        return False
+
