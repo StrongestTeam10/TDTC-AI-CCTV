@@ -267,26 +267,42 @@ def bulk_insert_pedestrian_coordinate_json(data_list, weather_info=None):
                 except Exception:
                     count = 0
             
-            # 3. 입구 인파 유입량 급증 (Inflow Spike) 감지 로직
-            # 평시 평균 입구 유입자 수 = 15명 기준, 2배인 30명 이상 시 급증 경보 발령
-            base_score = count * 3.5
-            final_score = round(min(100.0, base_score * weather_weight), 1)
-            
-            inflow_spike = (count >= 30) or (count >= 15 and weather_info and weather_info.get('inflow_monitor_active'))
-            
-            if inflow_spike and weather_info and weather_info.get('inflow_monitor_active'):
-                level = "HIGH"
-                reason = "RAIN_PREDICTION_INFLOW_SPIKE"
+            # 3. 입구 인파 유입량 급증 (Inflow Spike) 감지 로직 및 CRI 지표 적용
+            if 'cri_score' in ref_d and ref_d['cri_score'] is not None:
+                final_score = float(ref_d['cri_score'])
+                level = ref_d.get('risk_level', 'SAFE' if final_score < 40 else 'WARN' if final_score < 70 else 'HIGH')
+                reason = "AI_REALTIME_CRI"
             else:
-                level = "SAFE" if final_score < 40 else "WARN" if final_score < 70 else "HIGH"
-                reason = weather_info.get('reason_code', 'NORMAL') if weather_info else "NORMAL"
+                base_score = count * 3.5
+                final_score = round(min(100.0, base_score * weather_weight), 1)
+                inflow_spike = (count >= 30) or (count >= 15 and weather_info and weather_info.get('inflow_monitor_active'))
+                if inflow_spike and weather_info and weather_info.get('inflow_monitor_active'):
+                    level = "HIGH"
+                    reason = "RAIN_PREDICTION_INFLOW_SPIKE"
+                else:
+                    level = "SAFE" if final_score < 40 else "WARN" if final_score < 70 else "HIGH"
+                    reason = weather_info.get('reason_code', 'NORMAL') if weather_info else "NORMAL"
             
+            # ⭐️ occupancy_rate, stagnation_sec, video_url 추출
+            occ_rate = ref_d.get('occupancy_rate')
+            if occ_rate is None and count is not None:
+                occ_rate = min(100.0, round(count * 2.2, 1))
+
+            stag_sec = ref_d.get('stagnation_sec')
+            if stag_sec is None and count is not None:
+                stag_sec = round(min(25.0, max(0.0, (count - 8) * 0.7) if count > 8 else count * 0.15), 1)
+
+            v_url = ref_d.get('s3_clip_url') or ref_d.get('video_url')
+
             risk_list.append({
                 'coord_id': coord_id,
                 'risk_score': final_score,
                 'risk_level': level,
                 'reason_code': reason,
                 'total_count': count,
+                'occupancy_rate': occ_rate,
+                'stagnation_sec': stag_sec,
+                'video_url': v_url,
                 'detected_at': ref_d.get('captured_at', 'now()')
             })
 
@@ -402,7 +418,7 @@ def bulk_insert_crowd_density(data_list):
         return False
 
 def bulk_insert_risk_score(data_list):
-    """위험 점수 (mrkrisk01m) 일괄 적재 (최신 스키마: coord_id FK 연동)"""
+    """위험 점수 (mrkrisk01m) 일괄 적재 (최신 스키마: coord_id FK, occupancy_rate, stagnation_sec, video_url 연동)"""
     if not data_list:
         return True
     conn = get_db_connection()
@@ -413,7 +429,7 @@ def bulk_insert_risk_score(data_list):
         cursor = conn.cursor()
         query = """
             INSERT INTO mrkrisk01m 
-            (coord_id, risk_score, risk_level, reason_code, total_count, detected_at)
+            (coord_id, risk_score, risk_level, reason_code, total_count, occupancy_rate, stagnation_sec, video_url, detected_at)
             VALUES %s
         """
         tuples = [
@@ -423,6 +439,9 @@ def bulk_insert_risk_score(data_list):
                 d.get('risk_level', 'SAFE'),
                 d.get('reason_code', 'NORMAL'),
                 d.get('total_count', 0),
+                d.get('occupancy_rate'),
+                d.get('stagnation_sec'),
+                d.get('video_url'),
                 d.get('detected_at', 'now()')
             ) for d in data_list
         ]
@@ -430,7 +449,7 @@ def bulk_insert_risk_score(data_list):
         conn.commit()
         cursor.close()
         conn.close()
-        print(f"[SUCCESS] mrkrisk01m (위험 점수 이력) Supabase DB 적재 성공: {len(data_list)} rows")
+        print(f"[SUCCESS] mrkrisk01m (위험 점수 + occupancy_rate + stagnation_sec) Supabase DB 적재 성공: {len(data_list)} rows")
         return True
     except Exception as e:
         print(f"[ERROR] mrkrisk01m DB 적재 실패: {e}")

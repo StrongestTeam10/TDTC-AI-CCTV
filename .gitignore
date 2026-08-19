@@ -13,6 +13,7 @@ __pycache__/
 results/
 temp_uploads/
 cctv_upload/uploads/
+cctv_cache/
 legacy/
 *.mp4
 *.avi

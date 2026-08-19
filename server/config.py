@@ -17,11 +17,13 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 TEMP_UPLOAD_DIR = os.path.join(RESULTS_DIR, "temp_uploads")
 UPLOAD_DIR = os.path.join(BASE_DIR, "cctv_upload", "uploads")
+CACHE_DIR = os.path.join(BASE_DIR, "cctv_cache")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 sys.path.append(BASE_DIR)
 sys.path.append(CCTV_UPLOAD_DIR)
@@ -38,7 +40,7 @@ BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "tdtc-cctv-upload")
+S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME", "tdtc-cctv-upload")
 PYTHON_EXE = sys.executable
 
 # =========================================================================
