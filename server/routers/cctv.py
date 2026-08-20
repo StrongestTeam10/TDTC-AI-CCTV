@@ -217,12 +217,17 @@ async def generate_mjpeg_stream(zone_id: int):
     if orig_fps < 10 or orig_fps > 120:
         orig_fps = 30.0
     
-    # ⭐️ [30 FPS 고주사율 & 1.0x 정상 배속]
-    # Zone 1 (60fps -> 30fps): 2스텝 (1초에 60프레임치 정상 진행)
-    # Zone 2/3 (30fps -> 30fps): 1스텝 (1초에 30프레임치 정상 진행)
+    # ⭐️ [벽시계 기준 1.0x 정속 재생]
+    # 예전에는 "한 바퀴 = 원본 frame_step 프레임 진행"으로 고정돼 있어서, AI 처리
+    # 시간(elapsed)이 프레임 간격(33ms)을 넘는 순간부터 따라잡을 방법이 없어
+    # 재생이 슬로모션이 됐다(MJPEG는 타임스탬프가 없어 서버 송출 속도가 곧 재생 속도다).
+    # 이제 스트림 시작 시각을 기준으로 "지금 보여줘야 할 원본 프레임 번호"를 계산해
+    # 밀린 만큼 건너뛴다. 처리가 느리면 화면 fps가 떨어질 뿐 배속은 1.0x로 유지된다.
+    import time
     target_stream_fps = 30.0
     frame_interval = 1.0 / target_stream_fps
-    frame_step = max(1, int(round(orig_fps / target_stream_fps)))
+    stream_start = time.time()
+    consumed_frames = 0  # 지금까지 원본에서 소비(grab/read)한 프레임 수. 영상 루프와 무관하게 단조 증가.
 
     frame_idx = 0
     cached_boxes = []
@@ -238,15 +243,25 @@ async def generate_mjpeg_stream(zone_id: int):
 
     try:
         while True:
-            import time
             t_start = time.time()
 
-            # 정상 배속 유지를 위해 중간 프레임 건너뛰기
-            if frame_step > 1:
-                for _ in range(frame_step - 1):
-                    if not cap.grab():
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        cap.grab()
+            # 벽시계 기준으로 "지금 보여줘야 할 원본 프레임"까지 건너뛴다.
+            due_frames = int((t_start - stream_start) * orig_fps) + 1
+            advance = due_frames - consumed_frames
+            if advance < 1:
+                advance = 1
+            # 스톨(일시 정지·모델 로딩 등) 직후 수백 프레임을 한꺼번에 grab하며 폭주하지
+            # 않도록 상한(2초치)을 두고, 더 밀린 시간은 기준 시각을 옮겨 탕감한다.
+            max_advance = int(orig_fps * 2)
+            if advance > max_advance:
+                stream_start += (advance - max_advance) / orig_fps
+                advance = max_advance
+
+            for _ in range(advance - 1):
+                if not cap.grab():
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    cap.grab()
+            consumed_frames += advance
 
             ret, frame = cap.read()
             if not ret:
