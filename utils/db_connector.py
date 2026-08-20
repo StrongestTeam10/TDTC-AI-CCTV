@@ -9,11 +9,15 @@ from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
 def load_env():
-    # TDTC-AI-CCTV 및 상위 디렉터리의 .env 탐색 및 로드
+    # TDTC-AI-CCTV 및 상위 디렉터리의 프로필별 .env 탐색 및 로드
+    active_profile = (os.environ.get("APP_ENV") or os.environ.get("PROFILE") or "dev").lower()
     current_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        os.path.join(current_dir, "..", f".env.{active_profile}"),
         os.path.join(current_dir, "..", ".env"),
+        os.path.join(current_dir, "..", "..", f".env.{active_profile}"),
         os.path.join(current_dir, "..", "..", ".env"),
+        os.path.join(current_dir, "..", "..", "TDTC-AI-CCTV", f".env.{active_profile}"),
         os.path.join(current_dir, "..", "..", "TDTC-AI-CCTV", ".env"),
     ]
     for env_path in candidates:
@@ -33,8 +37,11 @@ if not DB_PASSWORD:
 
 
 def get_db_connection():
-    """Supabase PostgreSQL 접속 커넥션 반환"""
+    """프로필(dev/prod)에 따른 PostgreSQL 접속 커넥션 반환"""
     load_env()
+    active_profile = (os.environ.get("APP_ENV") or os.environ.get("PROFILE") or "dev").lower()
+    db_label = "AWS RDS" if active_profile == "prod" else "Supabase"
+
     host = os.environ.get("DEV_DB_HOST") or os.environ.get("DB_HOST", "aws-0-ap-northeast-1.pooler.supabase.com")
     port = int(os.environ.get("DEV_DB_PORT") or os.environ.get("DB_PORT", "6543"))
     dbname = os.environ.get("DEV_DB_NAME") or os.environ.get("DB_NAME", "postgres")
@@ -42,7 +49,7 @@ def get_db_connection():
     password = os.environ.get("DEV_DB_PASSWORD") or os.environ.get("DB_PASSWORD", "")
 
     if not user or not password:
-        print("[ERROR] DB_USER 또는 DB_PASSWORD 환경변수가 설정되지 않아 DB에 접속할 수 없습니다.")
+        print(f"[ERROR] DB_USER 또는 DB_PASSWORD 환경변수가 설정되지 않아 {db_label}에 접속할 수 없습니다.")
         return None
 
     try:
@@ -53,11 +60,14 @@ def get_db_connection():
             user=user,
             password=password,
             sslmode="require",
-            connect_timeout=15
+            connect_timeout=3 if active_profile == "prod" else 10
         )
         return conn
     except Exception as e:
-        print(f"[ERROR] Supabase DB 커넥션 실패: {e}")
+        if active_profile == "prod":
+            print(f"[INFO] [PROD 모드] AWS RDS 직접 접속 제한 (VPC 사설망 보호 중) -> 백엔드 Webhook 트랙으로 안전 연동")
+        else:
+            print(f"[ERROR] Supabase DB 커넥션 실패: {e}")
         return None
 
 def bulk_insert_pedestrian_coordinates(data_list):
@@ -214,7 +224,9 @@ def bulk_insert_pedestrian_coordinate_json(data_list, weather_info=None):
 
     conn = get_db_connection()
     if not conn:
-        print(f"[INFO] [DB 시뮬레이션 모드] Supabase 미연결로 pedaggr01h / mrkrisk01m 적재 건수만 기록: {len(data_list)} rows")
+        active_profile = (os.environ.get("APP_ENV") or os.environ.get("PROFILE") or "dev").lower()
+        db_label = "AWS RDS (VPC 사설망)" if active_profile == "prod" else "Supabase"
+        print(f"[INFO] [{active_profile.upper()} 모드] {db_label} 직통 미연결 -> pedaggr01h / mrkrisk01m 버퍼 기록: {len(data_list)} rows")
         return True
     try:
         cursor = conn.cursor()

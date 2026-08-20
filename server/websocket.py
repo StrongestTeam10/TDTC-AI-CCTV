@@ -21,11 +21,18 @@ class ConnectionManager:
             print(f"[WebSocket Disconnected] 현재 연결 수: {len(self.active_connections)}")
 
     async def broadcast(self, message: Dict[str, Any]):
+        dead_connections = []
         for connection in list(self.active_connections):
             try:
-                await connection.send_json(message)
-            except Exception as e:
-                print(f"[WebSocket Broadcast Error] {e}")
+                if connection.client_state.name == "CONNECTED":
+                    await connection.send_json(message)
+                else:
+                    dead_connections.append(connection)
+            except Exception:
+                dead_connections.append(connection)
+
+        for dead_conn in dead_connections:
+            self.disconnect(dead_conn)
 
 
 manager = ConnectionManager()
