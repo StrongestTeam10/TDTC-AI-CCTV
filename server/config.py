@@ -31,9 +31,23 @@ sys.path.append(os.path.join(BASE_DIR, "cctv_ai_pipeline"))
 sys.path.append(os.path.join(BASE_DIR, "cctv_ai_pipeline", "sensor_fusion_archive"))
 
 # =========================================================================
-# 환경 변수 로드
+# 환경 변수 및 프로필(Profile: dev / prod) 동적 로드
 # =========================================================================
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+active_profile = (os.environ.get("APP_ENV") or os.environ.get("PROFILE") or "prod").lower()
+
+env_files_to_try = [
+    os.path.join(BASE_DIR, f".env.{active_profile}"),
+    os.path.join(BASE_DIR, ".env")
+]
+
+loaded_file = None
+for ef in env_files_to_try:
+    if os.path.exists(ef):
+        load_dotenv(ef, override=True)
+        loaded_file = ef
+        break
+
+print(f"[Config] [Profile: {active_profile.upper()}] Loaded: {os.path.basename(loaded_file) if loaded_file else '.env'}")
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
 BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
