@@ -30,17 +30,17 @@ flowchart TD
     subgraph Cold_Track ["🗄️ Track 2: 클라우드 아카이빙 및 RDS 5대 테이블 적재"]
         direction TB
         %% 1분 영상 & 메트릭 벌크 적재
-        RENDERER -->|1. 1분 완주 모자이크 mp4 업로드| S3_RAW[("☁️ AWS S3 (raw-videos/)")]
-        RENDERER -->|2. POST /api/v1/video-clips| BE_CLIP["☕ Spring Boot 백엔드"]
-        RENDERER -->|3. POST /api/v1/metrics/bulk (600프레임 일괄 적재)| BE_BULK["☕ Spring Boot 백엔드"]
+        RENDERER -->|"1. 1분 완주 모자이크 mp4 업로드"| S3_RAW[("☁️ AWS S3 (raw-videos/)")]
+        RENDERER -->|"2. POST /api/v1/video-clips"| BE_CLIP["☕ Spring Boot 백엔드"]
+        RENDERER -->|"3. POST /api/v1/metrics/bulk (600프레임 일괄 적재)"| BE_BULK["☕ Spring Boot 백엔드"]
         
-        BE_CLIP -->|vdoclip01m 저장| RDS[(🗄️ AWS RDS PostgreSQL)]
-        BE_BULK -->|pedaggr01h / mrkrisk01m 저장| RDS
+        BE_CLIP -->|"vdoclip01m 저장"| RDS[("🗄️ AWS RDS PostgreSQL")]
+        BE_BULK -->|"pedaggr01h / mrkrisk01m 저장"| RDS
 
         %% 비상 위험 클립
-        BUF -->|위험 감지 시 35초 mp4 업로드| S3_DANGER[("☁️ AWS S3 (danger-clips/)")]
-        BUF -->|POST /api/ai/alerts/trigger| BE_ALERT["☕ Spring Boot 백엔드"]
-        BE_ALERT -->|emgalrt01h / pstrprt01h 저장 & SMS 발송| RDS
+        BUF -->|"위험 감지 시 35초 mp4 업로드"| S3_DANGER[("☁️ AWS S3 (danger-clips/)")]
+        BUF -->|"POST /api/ai/alerts/trigger"| BE_ALERT["☕ Spring Boot 백엔드"]
+        BE_ALERT -->|"emgalrt01h / pstrprt01h 저장 & SMS 발송"| RDS
     end
 ```
 
